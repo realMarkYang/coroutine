@@ -1,6 +1,5 @@
 #include "coroutine.h"
 #include <stdio.h>
-#include <ucontext.h>
 #include <assert.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -10,12 +9,22 @@
 #define STACK_SIZE (1024*1024)
 #define DEFAULT_COROUTINE 16
 
+typedef struct 
+{
+    void *regs[8];
+    // regs[0]: RBX,  regs[1]: RBP,  regs[2]: R12, 
+    // regs[3]: R13,  regs[4]: R14,  regs[5]: R15, 
+    // regs[6]: RSP,  regs[7]: RDI
+} coctx_t;
+
+//nasm function
+extern void coctx_swap(coctx_t *curr, coctx_t *pending);
 
 struct coroutine;
 struct schedule
 {
     char stack[STACK_SIZE];
-    ucontext_t main_ctx;
+    coctx_t main_ctx;
     int cnt_co; //current alive coroutine count
     int cap; //capacity
     int running_co; //current running coroutine id
@@ -26,7 +35,7 @@ typedef struct coroutine
 {
     coroutine_func func;
     void* ud;
-    ucontext_t ctx;
+    coctx_t ctx;
     schedule *s;
     ptrdiff_t cap;
     ptrdiff_t size;
@@ -62,8 +71,8 @@ schedule *coroutine_open()
     S->cap = DEFAULT_COROUTINE;
     S->cnt_co = 0;
     S->running_co = -1;
-    S->co = malloc(sizeof(schedule *)*DEFAULT_COROUTINE);
-    memset(S->co,0,S->cap);
+    S->co = malloc(sizeof(coroutine *) * DEFAULT_COROUTINE);
+    memset(S->co, 0, sizeof(coroutine *) * S->cap);
     return S;
 }
 
@@ -87,11 +96,8 @@ void coroutine_close(schedule *S)
 
 
 
-void mainfunc(uint32_t lowprt, uint32_t hprt)
+void mainfunc(schedule *S)
 {
-    uintptr_t ptr = (uintptr_t)hprt << 32 | (uintptr_t)lowprt;
-    schedule *S = (schedule *)ptr;
-
     int id = S->running_co;
     coroutine *co = S->co[id];
     co->func(S,co->ud);
@@ -150,7 +156,7 @@ void _co_save_stack(coroutine* co, char* top)
     }
     
     co->size = stack_size;
-    memcpy(co->stack,&dummy,stack_size);   
+    memcpy(co->stack, &dummy, stack_size);
 }
 
 
@@ -175,7 +181,7 @@ int coroutine_running(schedule *S)
 void coroutine_resume(schedule* S, int id)
 {
     assert(S->running_co == -1);
-    assert(id >= 0 && id <= S->cap);
+    assert(id >= 0 && id < S->cap);
 
     coroutine *co = S->co[id];
     if(co == NULL) return;
@@ -185,22 +191,26 @@ void coroutine_resume(schedule* S, int id)
     switch(status)
     {
         case C_READY:
-            getcontext(&co->ctx);
-            co->ctx.uc_stack.ss_sp = S->stack;
-            co->ctx.uc_stack.ss_size = STACK_SIZE;
-            co->ctx.uc_link = &S->main_ctx;
+            uintptr_t stack_top = (uintptr_t)(S->stack + STACK_SIZE);
+            //16字节对齐    
+            stack_top &= -16L;
+            //压入mainfunc的栈顶指针
+            stack_top -= sizeof(void *);
+            *(void **)stack_top = (void *)mainfunc;
+            memset(&co->ctx, 0, sizeof(co->ctx));
+            co->ctx.regs[6] = (void *)stack_top;
+            co->ctx.regs[7] = (void *)S;
             S->running_co = id;
             co->status = C_RUNNING;
-            uintptr_t ptr = (uintptr_t)S;
-            makecontext(&co->ctx, (void (*)(void))mainfunc, 2, (uint32_t)ptr, (uint32_t)(ptr >> 32));
-            swapcontext(&S->main_ctx, &co->ctx);
+            coctx_swap(&S->main_ctx, &co->ctx);
+        
             break;
         
         case C_SUSPEND:
             memcpy(S->stack + STACK_SIZE - co->size, co->stack, co->size);
             S->running_co = id;
             co->status = C_RUNNING;
-            swapcontext(&S->main_ctx, &co->ctx);
+            coctx_swap(&S->main_ctx, &co->ctx);
             break;
 
         default:
@@ -218,5 +228,5 @@ void coroutine_yield(schedule *S)
     _co_save_stack(co,S->stack + STACK_SIZE);
     co->status = C_SUSPEND;
     S->running_co = -1;
-	swapcontext(&co->ctx , &S->main_ctx);
+	coctx_swap(&co->ctx, &S->main_ctx);
 }
